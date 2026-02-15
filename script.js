@@ -20,7 +20,7 @@ const gauge = new RadialGauge({
     needleCircleSize: 7,
     needleCircleOuter: true,
     needleCircleInner: false,
-    animationDuration: 500,
+    animationDuration: 100, // Reduced to be more responsive
     animationRule: "linear",
     colorNeedle: "#ff3b3b",
     colorNeedleEnd: "#ff3b3b",
@@ -33,7 +33,9 @@ const gauge = new RadialGauge({
     colorValueBoxRectEnd: "#1a1a1a",
     colorValueBoxBackground: "#1a1a1a",
     fontValueSize: 45,
-    highlightsWidth: 10
+    highlightsWidth: 10,
+    valueInt: 1,
+    valueDec: 1
 }).draw();
 
 // Update gauge size on window resize
@@ -68,7 +70,8 @@ function updateGauge(value) {
         }
         gauge.update({
             maxValue: currentMax,
-            majorTicks: ticks
+            majorTicks: ticks,
+            highlights: [{ from: 0, to: currentMax, color: "rgba(255, 59, 59, 0.05)" }]
         });
     }
     gauge.value = value;
@@ -85,7 +88,8 @@ startBtn.addEventListener('click', async () => {
     currentMax = 100;
     gauge.update({
         maxValue: 100,
-        majorTicks: ["0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"]
+        majorTicks: ["0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"],
+        highlights: [{ from: 0, to: 100, color: "rgba(255, 59, 59, 0.05)" }]
     });
     [pingCard, downloadCard, uploadCard].forEach(c => {
         c.classList.remove('active', 'testing');
@@ -129,68 +133,109 @@ async function runPingTest() {
     return finalPing;
 }
 
-// Implement Download Test
+// Improved Speed measurement with throttling and sliding window
 async function runDownloadTest() {
     downloadCard.classList.add('testing', 'active');
     const startTime = performance.now();
-    const response = await fetch(`${ENDPOINT_DOWN}?bytes=25000000`, { cache: 'no-store' });
+    const response = await fetch(`${ENDPOINT_DOWN}?bytes=50000000`, { cache: 'no-store' }); // Increased to 50MB
     const reader = response.body.getReader();
     let receivedLength = 0;
+    let lastUpdate = performance.now();
+
+    // Sliding window for instantaneous speed
+    const windowSize = 500; // ms
+    const samples = [];
 
     while(true) {
         const {done, value} = await reader.read();
         if (done) break;
 
+        const now = performance.now();
         receivedLength += value.length;
-        const currentTime = performance.now();
-        const duration = (currentTime - startTime) / 1000;
+        samples.push({ t: now, bytes: value.length });
 
-        if (duration > 0) {
-            const bitsLoaded = receivedLength * 8;
-            const speedMbps = (bitsLoaded / duration) / 1000000;
-            downloadVal.innerText = speedMbps.toFixed(1);
+        // Cleanup old samples
+        while(samples.length > 0 && now - samples[0].t > windowSize) {
+            samples.shift();
+        }
 
-            updateGauge(speedMbps);
+        // Update UI every 100ms
+        if (now - lastUpdate > 100) {
+            const duration = (now - startTime) / 1000;
+            const avgSpeedMbps = ((receivedLength * 8) / duration) / 1000000;
+
+            // Instantaneous speed
+            const windowBytes = samples.reduce((acc, s) => acc + s.bytes, 0);
+            const windowDuration = samples.length > 1 ? (now - samples[0].t) / 1000 : 0.1;
+            const instSpeedMbps = ((windowBytes * 8) / windowDuration) / 1000000;
+
+            downloadVal.innerText = avgSpeedMbps.toFixed(1);
+            updateGauge(instSpeedMbps);
+            lastUpdate = now;
         }
     }
+
+    // Final update
+    const finalDuration = (performance.now() - startTime) / 1000;
+    const finalSpeedMbps = ((receivedLength * 8) / finalDuration) / 1000000;
+    downloadVal.innerText = finalSpeedMbps.toFixed(1);
+    updateGauge(finalSpeedMbps);
 
     downloadCard.classList.remove('testing');
 }
 
-// Implement Upload Test using multiple fetch requests to avoid CORS preflight while tracking progress
 async function runUploadTest() {
     uploadCard.classList.add('testing', 'active');
 
     const chunkSize = 1024 * 1024; // 1MB chunks
     const chunkData = "x".repeat(chunkSize);
-    const numChunks = 10; // Increased for better measurement
-    let totalBytesSent = 0;
+    const testDuration = 10000; // 10 seconds max
     const startTime = performance.now();
+    let totalBytesSent = 0;
+    let lastUpdate = performance.now();
 
-    for (let i = 0; i < numChunks; i++) {
+    const samples = [];
+
+    while (performance.now() - startTime < testDuration) {
         try {
+            const chunkStart = performance.now();
             await fetch(ENDPOINT_UP, {
                 method: 'POST',
                 body: chunkData,
                 mode: 'cors'
             });
+            const chunkEnd = performance.now();
 
             totalBytesSent += chunkSize;
-            const currentTime = performance.now();
-            const duration = (currentTime - startTime) / 1000;
+            const now = performance.now();
+            samples.push({ t: now, bytes: chunkSize });
 
-            if (duration > 0) {
-                const speedMbps = ((totalBytesSent * 8) / duration) / 1000000;
-                uploadVal.innerText = speedMbps.toFixed(1);
+            while(samples.length > 0 && now - samples[0].t > 1000) {
+                samples.shift();
+            }
 
-                updateGauge(speedMbps);
+            if (now - lastUpdate > 100) {
+                const totalDuration = (now - startTime) / 1000;
+                const avgSpeedMbps = ((totalBytesSent * 8) / totalDuration) / 1000000;
+
+                const windowBytes = samples.reduce((acc, s) => acc + s.bytes, 0);
+                const windowDuration = samples.length > 1 ? (now - samples[0].t) / 1000 : (chunkEnd - chunkStart) / 1000;
+                const instSpeedMbps = ((windowBytes * 8) / windowDuration) / 1000000;
+
+                uploadVal.innerText = avgSpeedMbps.toFixed(1);
+                updateGauge(instSpeedMbps);
+                lastUpdate = now;
             }
         } catch (error) {
             console.error('Upload chunk failed:', error);
-            uploadCard.classList.remove('testing');
-            throw error;
+            break;
         }
     }
+
+    const finalDuration = (performance.now() - startTime) / 1000;
+    const finalSpeedMbps = ((totalBytesSent * 8) / finalDuration) / 1000000;
+    uploadVal.innerText = finalSpeedMbps.toFixed(1);
+    updateGauge(finalSpeedMbps);
 
     uploadCard.classList.remove('testing');
 }
