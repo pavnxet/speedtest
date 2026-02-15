@@ -21,7 +21,7 @@ const gauge = new RadialGauge({
     needleCircleOuter: true,
     needleCircleInner: false,
     animationDuration: 500,
-    animationRule: "decelerate",
+    animationRule: "linear",
     colorNeedle: "#ff3b3b",
     colorNeedleEnd: "#ff3b3b",
     colorMajorTicks: "#eee",
@@ -142,49 +142,44 @@ async function runDownloadTest() {
     downloadCard.classList.remove('testing');
 }
 
-// Implement Upload Test
+// Implement Upload Test using multiple fetch requests to avoid CORS preflight while tracking progress
 async function runUploadTest() {
-    return new Promise((resolve, reject) => {
-        uploadCard.classList.add('testing', 'active');
-        // 10MB of dummy data
-        const data = new Uint8Array(10 * 1024 * 1024);
-        for (let i = 0; i < data.length; i++) data[i] = Math.random() * 255;
+    uploadCard.classList.add('testing', 'active');
 
-        const startTime = performance.now();
-        const xhr = new XMLHttpRequest();
+    const chunkSize = 1024 * 1024; // 1MB chunks
+    const chunkData = "x".repeat(chunkSize);
+    const numChunks = 5;
+    let totalBytesSent = 0;
+    const startTime = performance.now();
 
-        xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable) {
-                const currentTime = performance.now();
-                const duration = (currentTime - startTime) / 1000;
-                if (duration > 0) {
-                    const speedMbps = ((e.loaded * 8) / duration) / 1000000;
-                    uploadVal.innerText = speedMbps.toFixed(1);
+    for (let i = 0; i < numChunks; i++) {
+        try {
+            await fetch(ENDPOINT_UP, {
+                method: 'POST',
+                body: chunkData,
+                mode: 'cors'
+            });
 
-                    if (speedMbps > gauge.options.maxValue) {
-                        gauge.update({ maxValue: Math.ceil(speedMbps / 100) * 100 });
-                    }
-                    gauge.value = speedMbps;
+            totalBytesSent += chunkSize;
+            const currentTime = performance.now();
+            const duration = (currentTime - startTime) / 1000;
+
+            if (duration > 0) {
+                const speedMbps = ((totalBytesSent * 8) / duration) / 1000000;
+                uploadVal.innerText = speedMbps.toFixed(1);
+
+                if (speedMbps > gauge.options.maxValue) {
+                    gauge.update({ maxValue: Math.ceil(speedMbps / 100) * 100 });
                 }
+                gauge.value = speedMbps;
             }
-        };
-
-        xhr.onload = () => {
-            const endTime = performance.now();
-            const duration = (endTime - startTime) / 1000;
-            const finalMbps = ((data.length * 8) / duration) / 1000000;
-            uploadVal.innerText = finalMbps.toFixed(1);
-            gauge.value = finalMbps;
+        } catch (error) {
+            console.error('Upload chunk failed:', error);
+            // If even a simple fetch fails, it might be a true CORS issue or network issue
             uploadCard.classList.remove('testing');
-            resolve();
-        };
+            throw error;
+        }
+    }
 
-        xhr.onerror = () => {
-            uploadCard.classList.remove('testing');
-            reject(new Error('Upload failed'));
-        };
-
-        xhr.open('POST', ENDPOINT_UP);
-        xhr.send(data);
-    });
+    uploadCard.classList.remove('testing');
 }
