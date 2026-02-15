@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Redline Speedtest</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/canvas-gauges@2.1.7/gauge.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>REDLINE <span>SPEEDTEST</span></h1>
+        </header>
+
+        <main>
+            <div class="gauge-container">
+                <canvas id="speedometer"></canvas>
+            </div>
+
+            <div class="results">
+                <div class="result-card" id="ping-card">
+                    <span class="label">PING</span>
+                    <span class="value" id="ping">-</span>
+                    <span class="unit">ms</span>
+                </div>
+                <div class="result-card" id="download-card">
+                    <span class="label">DOWNLOAD</span>
+                    <span class="value" id="download">-</span>
+                    <span class="unit">Mbps</span>
+                </div>
+                <div class="result-card" id="upload-card">
+                    <span class="label">UPLOAD</span>
+                    <span class="value" id="upload">-</span>
+                    <span class="unit">Mbps</span>
+                </div>
+            </div>
+
+            <div class="controls">
+                <button id="start-btn">START TEST</button>
+            </div>
+        </main>
+
+        <footer>
+            <p>&copy; 2026 Redline Speedtest. Powered by Cloudflare.</p>
+        </footer>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
