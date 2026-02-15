@@ -32,8 +32,6 @@ const gauge = new RadialGauge({
     colorValueBoxRect: "#1a1a1a",
     colorValueBoxRectEnd: "#1a1a1a",
     colorValueBoxBackground: "#1a1a1a",
-    valueInt: 1,
-    valueDec: 1,
     fontValueSize: 45,
     highlightsWidth: 10
 }).draw();
@@ -60,6 +58,22 @@ const uploadCard = document.getElementById('upload-card');
 const ENDPOINT_DOWN = 'https://speed.cloudflare.com/__down';
 const ENDPOINT_UP = 'https://speed.cloudflare.com/__up';
 
+let currentMax = 100;
+function updateGauge(value) {
+    if (value > currentMax) {
+        currentMax = Math.ceil(value / 100) * 100;
+        const ticks = [];
+        for (let i = 0; i <= 10; i++) {
+            ticks.push((currentMax / 10 * i).toString());
+        }
+        gauge.update({
+            maxValue: currentMax,
+            majorTicks: ticks
+        });
+    }
+    gauge.value = value;
+}
+
 startBtn.addEventListener('click', async () => {
     startBtn.disabled = true;
     startBtn.innerText = 'TESTING...';
@@ -68,7 +82,11 @@ startBtn.addEventListener('click', async () => {
     pingVal.innerText = '-';
     downloadVal.innerText = '-';
     uploadVal.innerText = '-';
-    gauge.update({ maxValue: 100 });
+    currentMax = 100;
+    gauge.update({
+        maxValue: 100,
+        majorTicks: ["0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"]
+    });
     [pingCard, downloadCard, uploadCard].forEach(c => {
         c.classList.remove('active', 'testing');
     });
@@ -132,10 +150,7 @@ async function runDownloadTest() {
             const speedMbps = (bitsLoaded / duration) / 1000000;
             downloadVal.innerText = speedMbps.toFixed(1);
 
-            if (speedMbps > gauge.options.maxValue) {
-                gauge.update({ maxValue: Math.ceil(speedMbps / 100) * 100 });
-            }
-            gauge.value = speedMbps;
+            updateGauge(speedMbps);
         }
     }
 
@@ -148,7 +163,7 @@ async function runUploadTest() {
 
     const chunkSize = 1024 * 1024; // 1MB chunks
     const chunkData = "x".repeat(chunkSize);
-    const numChunks = 5;
+    const numChunks = 10; // Increased for better measurement
     let totalBytesSent = 0;
     const startTime = performance.now();
 
@@ -168,14 +183,10 @@ async function runUploadTest() {
                 const speedMbps = ((totalBytesSent * 8) / duration) / 1000000;
                 uploadVal.innerText = speedMbps.toFixed(1);
 
-                if (speedMbps > gauge.options.maxValue) {
-                    gauge.update({ maxValue: Math.ceil(speedMbps / 100) * 100 });
-                }
-                gauge.value = speedMbps;
+                updateGauge(speedMbps);
             }
         } catch (error) {
             console.error('Upload chunk failed:', error);
-            // If even a simple fetch fails, it might be a true CORS issue or network issue
             uploadCard.classList.remove('testing');
             throw error;
         }
