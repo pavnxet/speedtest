@@ -118,7 +118,14 @@ body {
   stroke-width: 13;
   stroke-linecap: round;
   filter: drop-shadow(0 0 6px rgba(255, 59, 59, 0.35));
-  transition: stroke-dashoffset 0.12s linear;
+}
+
+.gauge-metric {
+  font-size: 0.72rem;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--muted);
+  min-height: 1.1rem;
 }
 .gauge .tick-major { stroke: rgba(255, 255, 255, 0.55); stroke-width: 2; }
 .gauge .tick-minor { stroke: rgba(255, 255, 255, 0.18); stroke-width: 1; }

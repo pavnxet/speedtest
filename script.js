@@ -18,6 +18,13 @@ const HISTORY_KEY = 'redline.speedtest.history.v1';
 const UNIT_KEY = 'redline.speedtest.unit.v1';
 const HISTORY_MAX = 10;
 
+/* Live-display tuning: how much we smooth the running speed so the
+   needle and number stay readable instead of flickering with every
+   network fluctuation. */
+const LIVE_WINDOW_MS = 1000; // rolling window used to estimate current speed
+const LIVE_UI_MS = 180;      // minimum gap between UI updates
+const LIVE_ALPHA = 0.22;     // EMA smoothing factor for the live value
+
 /* ------------------------------------------------------------------
    Tiny helpers
 ------------------------------------------------------------------ */
@@ -49,16 +56,47 @@ function niceMax(v) {
   return Math.ceil(v / 1000) * 1000;
 }
 
+/* Exponential moving average, used to calm the live reading. */
+class Smoother {
+  constructor(alpha) {
+    this.alpha = alpha;
+    this.v = null;
+  }
+  push(x) {
+    if (!isNum(x) || x < 0) return this.v;
+    this.v = this.v == null ? x : this.v + this.alpha * (x - this.v);
+    return this.v;
+  }
+  reset() {
+    this.v = null;
+  }
+}
+
+/* Estimate the current throughput (Mbps) from a rolling window of
+   {t, bytes} samples, so short-lived spikes do not dominate. */
+function windowRate(win, now) {
+  while (win.length && win[0].t < now - LIVE_WINDOW_MS) win.shift();
+  if (win.length < 2) return null;
+  let bytes = 0;
+  for (let i = 0; i < win.length; i++) bytes += win[i].bytes;
+  const dt = (now - win[0].t) / 1000;
+  if (dt <= 0) return null;
+  return (bytes * 8) / dt / 1e6;
+}
+
 /* ------------------------------------------------------------------
    Self-contained SVG gauge (no external CDN dependency)
+   The progress arc is redrawn analytically every frame, so it never
+   depends on getTotalLength() / stroke-dasharray, which render
+   inconsistently across browsers.
 ------------------------------------------------------------------ */
 class Gauge {
   constructor(el) {
     this.el = el;
     this.cx = 150;
     this.cy = 150;
-    this.start = -120;   // degrees, measured clockwise from 12 o'clock
-    this.sweep = 240;
+    this.startDeg = -120;   // degrees, measured clockwise from 12 o'clock
+    this.sweepDeg = 240;
     this.rTrack = 120;
     this.min = 0;
     this.max = 100;
@@ -74,11 +112,14 @@ class Gauge {
     return [this.cx + r * Math.sin(rad), this.cy - r * Math.cos(rad)];
   }
 
-  _arc(from, to, r) {
-    const [x1, y1] = this._polar(from, r);
-    const [x2, y2] = this._polar(to, r);
-    const large = to - from > 180 ? 1 : 0;
-    return `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;
+  _arcD(fromDeg, toDeg, r) {
+    const span = toDeg - fromDeg;
+    if (Math.abs(span) < 0.4) return '';
+    const [x1, y1] = this._polar(fromDeg, r);
+    const [x2, y2] = this._polar(toDeg, r);
+    const large = Math.abs(span) > 180 ? 1 : 0;
+    const sweep = span >= 0 ? 1 : 0;
+    return `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${large} ${sweep} ${x2.toFixed(2)} ${y2.toFixed(2)}`;
   }
 
   _tickLabel(v) {
@@ -91,14 +132,14 @@ class Gauge {
     const n = 10;
     let out = '';
     for (let i = 0; i <= n; i++) {
-      const deg = this.start + this.sweep * (i / n);
+      const deg = this.startDeg + this.sweepDeg * (i / n);
       const [x1, y1] = this._polar(deg, 108);
       const [x2, y2] = this._polar(deg, 96);
       out += `<line class="tick-major" x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"/>`;
       const [lx, ly] = this._polar(deg, 82);
       out += `<text class="tick-label" x="${lx.toFixed(1)}" y="${ly.toFixed(1)}">${this._tickLabel(this.max * (i / n))}</text>`;
       if (i < n) {
-        const d2 = this.start + this.sweep * ((i + 0.5) / n);
+        const d2 = this.startDeg + this.sweepDeg * ((i + 0.5) / n);
         const [mx1, my1] = this._polar(d2, 105);
         const [mx2, my2] = this._polar(d2, 98);
         out += `<line class="tick-minor" x1="${mx1.toFixed(1)}" y1="${my1.toFixed(1)}" x2="${mx2.toFixed(1)}" y2="${my2.toFixed(1)}"/>`;
@@ -108,8 +149,9 @@ class Gauge {
   }
 
   _build() {
+    const track = this._arcD(this.startDeg, this.startDeg + this.sweepDeg, this.rTrack);
     this.el.innerHTML = `
-      <svg viewBox="0 0 300 300" class="gauge-svg" role="img" aria-label="Live speed gauge">
+      <svg viewBox="0 0 300 300" class="gauge-svg" role="img" aria-label="Speed gauge" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <linearGradient id="gaugeGrad" x1="0" y1="1" x2="1" y2="0">
             <stop offset="0%" stop-color="#2bd67b"/>
@@ -117,12 +159,12 @@ class Gauge {
             <stop offset="100%" stop-color="#ff3b3b"/>
           </linearGradient>
         </defs>
-        <path class="track" d="${this._arc(this.start, this.start + this.sweep, this.rTrack)}"/>
-        <path class="progress" d="${this._arc(this.start, this.start + this.sweep, this.rTrack)}"/>
+        <path class="track" d="${track}" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="13" stroke-linecap="round"/>
+        <path class="progress" d="" fill="none" stroke="url(#gaugeGrad)" stroke-width="13" stroke-linecap="round"/>
         <g class="ticks">${this._ticksMarkup()}</g>
-        <g class="needle"><polygon points="150,58 145.4,150 154.6,150"/></g>
-        <circle class="hub" cx="150" cy="150" r="6"/>
-        <circle class="hub-ring" cx="150" cy="150" r="11"/>
+        <g class="needle"><polygon points="150,58 145.4,150 154.6,150" fill="#ff3b3b"/></g>
+        <circle class="hub" cx="150" cy="150" r="6" fill="#ffffff"/>
+        <circle class="hub-ring" cx="150" cy="150" r="11" fill="none" stroke="#ff3b3b" stroke-width="3"/>
         <text class="gauge-value" x="150" y="200">0</text>
         <text class="gauge-unit" x="150" y="222">Mbps</text>
       </svg>`;
@@ -132,17 +174,13 @@ class Gauge {
     this.needleEl = this.el.querySelector('.needle');
     this.valueEl = this.el.querySelector('.gauge-value');
     this.unitEl = this.el.querySelector('.gauge-unit');
-
-    this.len = this.progressEl.getTotalLength();
-    this.progressEl.style.strokeDasharray = `${this.len}`;
-    this.progressEl.style.strokeDashoffset = `${this.len}`;
     this.render();
   }
 
   _applyMax(m) {
     if (m === this.max) return;
     this.max = m;
-    this.ticksEl.innerHTML = this._ticksMarkup();
+    if (this.ticksEl) this.ticksEl.innerHTML = this._ticksMarkup();
   }
 
   setUnit(u) {
@@ -176,7 +214,7 @@ class Gauge {
         this._raf = null;
         return;
       }
-      this.shown += diff * 0.18;
+      this.shown += diff * 0.16;
       this.render();
       this._loop();
     });
@@ -184,9 +222,9 @@ class Gauge {
 
   render() {
     const f = clamp((this.shown - this.min) / (this.max - this.min), 0, 1);
-    const deg = this.start + this.sweep * f;
-    if (this.needleEl) this.needleEl.setAttribute('transform', `rotate(${deg.toFixed(2)} 150 150)`);
-    if (this.progressEl) this.progressEl.style.strokeDashoffset = `${this.len * (1 - f)}`;
+    const deg = this.startDeg + this.sweepDeg * f;
+    if (this.needleEl) this.needleEl.setAttribute('transform', `rotate(${deg.toFixed(2)} ${this.cx} ${this.cy})`);
+    if (this.progressEl) this.progressEl.setAttribute('d', this._arcD(this.startDeg, deg, this.rTrack));
     if (this.valueEl) this.valueEl.textContent = this.shown >= 100 ? this.shown.toFixed(0) : this.shown.toFixed(1);
     if (this.unitEl) this.unitEl.textContent = this.unit;
   }
@@ -272,7 +310,7 @@ async function measureLatency(signal, onSample) {
   return { ping, jitter, loss, samples: pings.length };
 }
 
-async function measureDownload(signal, onProgress) {
+async function measureDownload(signal, onLive) {
   const plan = [
     { bytes: 1e5, count: 3 },
     { bytes: 3e5, count: 3 },
@@ -282,7 +320,7 @@ async function measureDownload(signal, onProgress) {
     { bytes: 2.5e7, count: 1 },
   ];
   const points = [];
-  let peak = 0;
+  const smoother = new Smoother(LIVE_ALPHA);
 
   for (const step of plan) {
     for (let i = 0; i < step.count; i++) {
@@ -295,19 +333,19 @@ async function measureDownload(signal, onProgress) {
 
       if (res.body && res.body.getReader) {
         const reader = res.body.getReader();
-        let lastT = t0;
-        let lastBytes = 0;
+        const win = [];
+        let lastUi = t0;
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          received += value.length;
           const now = performance.now();
-          if (now - lastT >= 120) {
-            const inst = ((received - lastBytes) * 8) / ((now - lastT) / 1000) / 1e6;
-            peak = Math.max(peak, inst);
-            if (onProgress) onProgress(inst, false);
-            lastT = now;
-            lastBytes = received;
+          received += value.length;
+          win.push({ t: now, bytes: value.length });
+          while (win.length && win[0].t < now - LIVE_WINDOW_MS) win.shift();
+          if (now - lastUi >= LIVE_UI_MS) {
+            const rate = windowRate(win, now);
+            if (rate != null && onLive) onLive(smoother.push(rate));
+            lastUi = now;
           }
         }
       } else {
@@ -318,7 +356,6 @@ async function measureDownload(signal, onProgress) {
       const dur = (performance.now() - t0) / 1000;
       const bps = dur > 0 ? (received * 8) / dur : 0;
       points.push({ bytes: received, dur, bps });
-      if (onProgress) onProgress(bps / 1e6, true);
     }
     const last = points[points.length - 1];
     if (last && last.dur >= 2.5) break; // large enough to be representative
@@ -326,14 +363,17 @@ async function measureDownload(signal, onProgress) {
 
   const usable = points.filter((p) => p.dur >= 0.8);
   const pool = (usable.length ? usable : points).map((p) => p.bps);
-  return { value: percentile(pool, 0.9) / 1e6, peak, points };
+  return { value: percentile(pool, 0.9) / 1e6, points };
 }
 
-function uploadOnce(url, blob, signal, onProgress) {
+function uploadOnce(url, blob, signal, onLive) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url, true);
     const t0 = performance.now();
+    const win = [];
+    let lastLoaded = 0;
+    let lastUi = t0;
     const onAbort = () => xhr.abort();
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
@@ -342,9 +382,15 @@ function uploadOnce(url, blob, signal, onProgress) {
     };
 
     xhr.upload.onprogress = (e) => {
-      const dt = (performance.now() - t0) / 1000;
-      if (dt > 0 && e.loaded > 0 && onProgress) {
-        onProgress((e.loaded * 8) / dt / 1e6, false);
+      const now = performance.now();
+      const delta = e.loaded - lastLoaded;
+      lastLoaded = e.loaded;
+      if (delta > 0) win.push({ t: now, bytes: delta });
+      while (win.length && win[0].t < now - LIVE_WINDOW_MS) win.shift();
+      if (now - lastUi >= LIVE_UI_MS) {
+        const rate = windowRate(win, now);
+        if (rate != null && onLive) onLive(rate);
+        lastUi = now;
       }
     };
     xhr.onload = () => {
@@ -367,7 +413,7 @@ function uploadOnce(url, blob, signal, onProgress) {
   });
 }
 
-async function measureUpload(signal, onProgress) {
+async function measureUpload(signal, onLive) {
   const plan = [
     { bytes: 1e5, count: 3 },
     { bytes: 5e5, count: 3 },
@@ -376,17 +422,17 @@ async function measureUpload(signal, onProgress) {
     { bytes: 1e7, count: 1 },
   ];
   const points = [];
-  let peak = 0;
+  const smoother = new Smoother(LIVE_ALPHA);
 
   for (const step of plan) {
     const blob = new Blob([new Uint8Array(step.bytes)]);
     for (let i = 0; i < step.count; i++) {
       throwIfAborted(signal);
-      const dur = await uploadOnce(CF.up, blob, signal, onProgress);
+      const dur = await uploadOnce(CF.up, blob, signal, (rate) => {
+        if (onLive) onLive(smoother.push(rate));
+      });
       const bps = dur > 0 ? (step.bytes * 8) / dur : 0;
-      peak = Math.max(peak, bps);
       points.push({ bytes: step.bytes, dur, bps });
-      if (onProgress) onProgress(bps / 1e6, true);
     }
     const last = points[points.length - 1];
     if (last && last.dur >= 2.5) break;
@@ -394,7 +440,7 @@ async function measureUpload(signal, onProgress) {
 
   const usable = points.filter((p) => p.dur >= 0.8);
   const pool = (usable.length ? usable : points).map((p) => p.bps);
-  return { value: percentile(pool, 0.9) / 1e6, peak, points };
+  return { value: percentile(pool, 0.9) / 1e6, points };
 }
 
 async function fetchMeta(signal) {
@@ -473,6 +519,7 @@ function activityVerdicts(r) {
 const el = {
   phase: $('phase'),
   phaseText: $('phase-text'),
+  gaugeMetric: $('gauge-metric'),
   start: $('start'),
   stop: $('stop'),
   unit: $('unit'),
@@ -513,6 +560,10 @@ function setPhase(text, mode) {
   el.phaseText.textContent = text;
   el.phase.classList.remove('is-live', 'is-done', 'is-err');
   if (mode) el.phase.classList.add('is-' + mode);
+}
+
+function setGaugeMetric(text) {
+  if (el.gaugeMetric) el.gaugeMetric.textContent = text;
 }
 
 function activateCard(name) {
@@ -587,6 +638,7 @@ async function runTest() {
 
   try {
     setPhase('Measuring latency…', 'live');
+    setGaugeMetric('Latency');
     activateCard('ping');
     await warmup(signal);
 
@@ -600,27 +652,33 @@ async function runTest() {
     renderResults();
 
     setPhase('Measuring download…', 'live');
+    setGaugeMetric('Download · live');
     activateCard('download');
-    const dl = await measureDownload(signal, (mbps) => {
+    const dl = await measureDownload(signal, (live) => {
       gauge.setUnit(state.unit);
-      gauge.setValue(toDisplay(mbps));
-      setCardValue('download', fmtSpeed(mbps));
+      gauge.setValue(toDisplay(live));
+      setCardValue('download', fmtSpeed(live));
     });
     state.results.down = dl.value;
     setCardValue('download', fmtSpeed(dl.value));
+    renderResults();
 
     setPhase('Measuring upload…', 'live');
+    setGaugeMetric('Upload · live');
     activateCard('upload');
-    const ul = await measureUpload(signal, (mbps) => {
+    const ul = await measureUpload(signal, (live) => {
       gauge.setUnit(state.unit);
-      gauge.setValue(toDisplay(mbps));
-      setCardValue('upload', fmtSpeed(mbps));
+      gauge.setValue(toDisplay(live));
+      setCardValue('upload', fmtSpeed(live));
     });
     state.results.up = ul.value;
     setCardValue('upload', fmtSpeed(ul.value));
 
     activateCard(null);
     renderResults();
+
+    // Settle the needle on the measured result — never the last fluctuation.
+    setGaugeMetric('Download · result');
     gauge.setValue(toDisplay(state.results.down || 0));
 
     setPhase('Test complete', 'done');
@@ -630,10 +688,12 @@ async function runTest() {
     activateCard(null);
     if (e && e.name === 'AbortError') {
       setPhase('Stopped', 'err');
+      setGaugeMetric('Stopped');
       toast('Test stopped.');
     } else {
       console.error(e);
       setPhase('Test failed', 'err');
+      setGaugeMetric('Failed');
       toast('Speed test failed: ' + (e && e.message ? e.message : 'unknown error'), true);
     }
   } finally {
@@ -727,7 +787,6 @@ async function copySummary() {
     await navigator.clipboard.writeText(text);
     toast('Result copied to clipboard.');
   } catch (e) {
-    // Fallback for browsers without clipboard API / insecure context
     const ta = document.createElement('textarea');
     ta.value = text;
     ta.style.position = 'fixed';

@@ -9,6 +9,11 @@ Pages (or any static host) and it works.
 ## Features
 
 - **Live SVG gauge** — hand-built, animated speedometer (no third-party gauge library).
+  The progress arc is redrawn analytically each frame, so it never depends on
+  `getTotalLength()` / `stroke-dasharray` (which render inconsistently across browsers).
+- **Smoothed live reading** — the running speed is a rolling-window average with exponential
+  smoothing, so the needle stays readable instead of chasing every network fluctuation. The
+  value it finally settles on is the measured result (90th percentile), not the last sample.
 - **Latency, jitter & packet loss** — measured from a burst of edge round-trips.
 - **Download & upload bandwidth** — progressive ramp-up across increasing payload sizes,
   scored with the 90th-percentile method (the same approach Cloudflare's own test uses).
