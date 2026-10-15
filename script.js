@@ -188,6 +188,12 @@ class Gauge {
     this.render();
   }
 
+  /* Re-fit the dial to a value so the final result sits sensibly on the
+     scale, instead of being squashed by a larger reading from another phase. */
+  setScaleFor(v) {
+    this._applyMax(niceMax(Math.max(isNum(v) ? v : 0, 1)));
+  }
+
   setValue(v) {
     v = isNum(v) ? Math.max(0, v) : 0;
     if (v > this.max) this._applyMax(niceMax(v));
@@ -334,137 +340,162 @@ async function measureLatency(signal, onSample) {
   return { ping, jitter, loss, samples: pings.length };
 }
 
-async function measureDownload(signal, onLive) {
-  const plan = [
-    { bytes: 1e5, count: 3 },
-    { bytes: 3e5, count: 3 },
-    { bytes: 1e6, count: 3 },
-    { bytes: 5e6, count: 2 },
-    { bytes: 1e7, count: 2 },
-    { bytes: 2.5e7, count: 1 },
-  ];
-  const points = [];
+/* Bandwidth is measured the way the major speed tests do it: several
+   parallel streams running for a fixed window, scoring the steady-state
+   throughput. A single stream cannot fill a fast link and systematically
+   under-reports, which is why results disagreed with other tests. */
+const BW = {
+  download: { streams: 4, chunk: 2.5e7, durationMs: 7000, minMs: 1500, maxBytes: 120e6 },
+  upload: { streams: 3, chunk: 1e7, durationMs: 7000, minMs: 1500, maxBytes: 50e6 },
+  warmupMs: 700, // ignore the TCP ramp-up at the start of each run
+};
+
+function makeSampler(t0, onLive) {
+  const win = [];
+  const samples = [];
   const smoother = new Smoother(LIVE_ALPHA);
+  let lastUi = t0;
 
-  for (const step of plan) {
-    for (let i = 0; i < step.count; i++) {
-      throwIfAborted(signal);
-      const res = await fetch(`${CF.down}?bytes=${step.bytes}`, { cache: 'no-store', signal });
+  const push = (bytes, now) => {
+    win.push({ t: now, bytes });
+    while (win.length && win[0].t < now - LIVE_WINDOW_MS) win.shift();
+  };
+  const maybeSample = (now) => {
+    if (now - lastUi < LIVE_UI_MS) return;
+    lastUi = now;
+    const rate = windowRate(win, now);
+    if (rate == null) return;
+    samples.push({ t: now, mbps: rate });
+    if (onLive) onLive(smoother.push(rate));
+  };
+  const result = () => {
+    const steady = samples.filter((s) => s.t - t0 > BW.warmupMs).map((s) => s.mbps);
+    const pool = steady.length >= 3 ? steady : samples.map((s) => s.mbps);
+    return pool.length ? percentile(pool, 0.9) : 0;
+  };
+  return { push, maybeSample, result };
+}
+
+async function measureDownload(signal, onLive) {
+  const cfg = BW.download;
+  const t0 = performance.now();
+  const sampler = makeSampler(t0, onLive);
+  const hardStop = new AbortController();
+  const onOuterAbort = () => hardStop.abort();
+  if (signal) signal.addEventListener('abort', onOuterAbort, { once: true });
+  let total = 0;
+  let stop = false;
+
+  const worker = async () => {
+    while (!stop) {
+      let res;
+      try {
+        res = await fetch(`${CF.down}?bytes=${cfg.chunk}`, { cache: 'no-store', signal: hardStop.signal });
+      } catch (e) {
+        if (hardStop.signal.aborted) return;
+        throw e;
+      }
       if (!res.ok) throw new Error('Download endpoint returned ' + res.status);
-
-      const t0 = performance.now();
-      let received = 0;
-
-      if (res.body && res.body.getReader) {
-        const reader = res.body.getReader();
-        const win = [];
-        let lastUi = t0;
+      const reader = res.body.getReader();
+      try {
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
           const now = performance.now();
-          received += value.length;
-          win.push({ t: now, bytes: value.length });
-          while (win.length && win[0].t < now - LIVE_WINDOW_MS) win.shift();
-          if (now - lastUi >= LIVE_UI_MS) {
-            const rate = windowRate(win, now);
-            if (rate != null && onLive) onLive(smoother.push(rate));
-            lastUi = now;
+          total += value.length;
+          sampler.push(value.length, now);
+          sampler.maybeSample(now);
+          const elapsed = now - t0;
+          if (elapsed >= cfg.durationMs || (total >= cfg.maxBytes && elapsed >= cfg.minMs)) {
+            stop = true;
+            hardStop.abort();
+            return;
           }
         }
-      } else {
-        const buf = await res.arrayBuffer();
-        received = buf.byteLength;
+      } catch (e) {
+        if (hardStop.signal.aborted) return;
+        throw e;
       }
-
-      const dur = (performance.now() - t0) / 1000;
-      const bps = dur > 0 ? (received * 8) / dur : 0;
-      points.push({ bytes: received, dur, bps });
     }
-    const last = points[points.length - 1];
-    if (last && last.dur >= 2.5) break; // large enough to be representative
+  };
+
+  try {
+    await Promise.all(Array.from({ length: cfg.streams }, () => worker()));
+  } finally {
+    if (signal) signal.removeEventListener('abort', onOuterAbort);
   }
-
-  const usable = points.filter((p) => p.dur >= 0.8);
-  const pool = (usable.length ? usable : points).map((p) => p.bps);
-  return { value: percentile(pool, 0.9) / 1e6, points };
-}
-
-function uploadOnce(url, blob, signal, onLive) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url, true);
-    const t0 = performance.now();
-    const win = [];
-    let lastLoaded = 0;
-    let lastUi = t0;
-    const onAbort = () => xhr.abort();
-    if (signal) signal.addEventListener('abort', onAbort, { once: true });
-
-    const cleanup = () => {
-      if (signal) signal.removeEventListener('abort', onAbort);
-    };
-
-    xhr.upload.onprogress = (e) => {
-      const now = performance.now();
-      const delta = e.loaded - lastLoaded;
-      lastLoaded = e.loaded;
-      if (delta > 0) win.push({ t: now, bytes: delta });
-      while (win.length && win[0].t < now - LIVE_WINDOW_MS) win.shift();
-      if (now - lastUi >= LIVE_UI_MS) {
-        const rate = windowRate(win, now);
-        if (rate != null && onLive) onLive(rate);
-        lastUi = now;
-      }
-    };
-    xhr.onload = () => {
-      cleanup();
-      if (xhr.status >= 200 && xhr.status < 400) {
-        resolve((performance.now() - t0) / 1000);
-      } else {
-        reject(new Error('Upload endpoint returned ' + xhr.status));
-      }
-    };
-    xhr.onerror = () => {
-      cleanup();
-      reject(new Error('Upload request failed (network or CORS)'));
-    };
-    xhr.onabort = () => {
-      cleanup();
-      reject(abortError());
-    };
-    xhr.send(blob);
-  });
+  if (signal && signal.aborted) throw abortError();
+  return { value: sampler.result() };
 }
 
 async function measureUpload(signal, onLive) {
-  const plan = [
-    { bytes: 1e5, count: 3 },
-    { bytes: 5e5, count: 3 },
-    { bytes: 2e6, count: 2 },
-    { bytes: 5e6, count: 2 },
-    { bytes: 1e7, count: 1 },
-  ];
-  const points = [];
-  const smoother = new Smoother(LIVE_ALPHA);
+  const cfg = BW.upload;
+  const t0 = performance.now();
+  const sampler = makeSampler(t0, onLive);
+  const blob = new Blob([new Uint8Array(cfg.chunk)]);
+  const active = new Set();
+  let total = 0;
+  let stop = false;
+  const killAll = () => {
+    stop = true;
+    active.forEach((x) => {
+      try {
+        x.abort();
+      } catch (e) {
+        /* ignore */
+      }
+    });
+  };
+  if (signal) signal.addEventListener('abort', killAll, { once: true });
 
-  for (const step of plan) {
-    const blob = new Blob([new Uint8Array(step.bytes)]);
-    for (let i = 0; i < step.count; i++) {
-      throwIfAborted(signal);
-      const dur = await uploadOnce(CF.up, blob, signal, (rate) => {
-        if (onLive) onLive(smoother.push(rate));
-      });
-      const bps = dur > 0 ? (step.bytes * 8) / dur : 0;
-      points.push({ bytes: step.bytes, dur, bps });
-    }
-    const last = points[points.length - 1];
-    if (last && last.dur >= 2.5) break;
+  const worker = () =>
+    new Promise((resolve, reject) => {
+      const run = () => {
+        if (stop) return resolve();
+        const xhr = new XMLHttpRequest();
+        active.add(xhr);
+        xhr.open('POST', CF.up, true);
+        let prev = 0;
+        xhr.upload.onprogress = (e) => {
+          const now = performance.now();
+          const delta = e.loaded - prev;
+          prev = e.loaded;
+          if (delta > 0) {
+            total += delta;
+            sampler.push(delta, now);
+          }
+          sampler.maybeSample(now);
+          const elapsed = now - t0;
+          if (elapsed >= cfg.durationMs || (total >= cfg.maxBytes && elapsed >= cfg.minMs)) {
+            killAll();
+          }
+        };
+        xhr.onload = () => {
+          active.delete(xhr);
+          if (stop) return resolve();
+          run();
+        };
+        xhr.onerror = () => {
+          active.delete(xhr);
+          if (stop) return resolve();
+          reject(new Error('Upload request failed (network or CORS)'));
+        };
+        xhr.onabort = () => {
+          active.delete(xhr);
+          resolve();
+        };
+        xhr.send(blob);
+      };
+      run();
+    });
+
+  try {
+    await Promise.all(Array.from({ length: cfg.streams }, () => worker()));
+  } finally {
+    if (signal) signal.removeEventListener('abort', killAll);
   }
-
-  const usable = points.filter((p) => p.dur >= 0.8);
-  const pool = (usable.length ? usable : points).map((p) => p.bps);
-  return { value: percentile(pool, 0.9) / 1e6, points };
+  if (signal && signal.aborted) throw abortError();
+  return { value: sampler.result() };
 }
 
 async function fetchMeta(signal) {
@@ -678,14 +709,19 @@ async function runTest() {
     activateCard('jitter');
     renderResults();
 
+    // A phase token guards the live callbacks: once a phase is over, a late
+    // callback can no longer move the needle or overwrite a finished value.
+    let livePhase = 'download';
     setPhase('Measuring download…', 'live');
     setGaugeMetric('Download · live');
     activateCard('download');
     const dl = await measureDownload(signal, (live) => {
+      if (livePhase !== 'download') return;
       gauge.setUnit(state.unit);
       gauge.setValue(toDisplay(live));
       setCardValue('download', fmtSpeed(live));
     });
+    livePhase = 'idle';
     state.results.down = dl.value;
     setCardValue('download', fmtSpeed(dl.value));
     renderResults();
@@ -693,11 +729,14 @@ async function runTest() {
     setPhase('Measuring upload…', 'live');
     setGaugeMetric('Upload · live');
     activateCard('upload');
+    livePhase = 'upload';
     const ul = await measureUpload(signal, (live) => {
+      if (livePhase !== 'upload') return;
       gauge.setUnit(state.unit);
       gauge.setValue(toDisplay(live));
       setCardValue('upload', fmtSpeed(live));
     });
+    livePhase = 'idle';
     state.results.up = ul.value;
     setCardValue('upload', fmtSpeed(ul.value));
 
@@ -706,7 +745,9 @@ async function runTest() {
 
     // Settle the needle on the measured result — never the last fluctuation.
     setGaugeMetric('Download · result');
-    gauge.setValue(toDisplay(state.results.down || 0));
+    const finalDown = toDisplay(state.results.down || 0);
+    gauge.setScaleFor(finalDown);
+    gauge.setValue(finalDown);
 
     setPhase('Test complete', 'done');
     el.share.disabled = false;
@@ -882,7 +923,10 @@ function init() {
       /* ignore */
     }
     gauge.setUnit(state.unit);
-    if (isNum(state.results.down)) gauge.setValue(toDisplay(state.results.down));
+    if (isNum(state.results.down)) {
+      gauge.setScaleFor(toDisplay(state.results.down));
+      gauge.setValue(toDisplay(state.results.down));
+    }
     renderResults();
     renderHistory();
   });

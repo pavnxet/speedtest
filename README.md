@@ -16,8 +16,9 @@ Pages (or any static host) and it works.
   smoothing, so the needle stays readable instead of chasing every network fluctuation. The
   value it finally settles on is the measured result (90th percentile), not the last sample.
 - **Latency, jitter & packet loss** — measured from a burst of edge round-trips.
-- **Download & upload bandwidth** — progressive ramp-up across increasing payload sizes,
-  scored with the 90th-percentile method (the same approach Cloudflare's own test uses).
+- **Download & upload bandwidth** — measured with several parallel streams over a fixed
+  window, the way the major speed tests work, scoring the steady-state throughput with the
+  90th-percentile method.
 - **Network quality score** — an A+ → F grade with a ring, plus Streaming / Gaming /
   Video-call readiness checks.
 - **Connection details** — edge server location (IATA colo code + city), your ISP / ASN and IP.
@@ -38,10 +39,12 @@ The app talks to three public, CORS-enabled Cloudflare endpoints:
 
 - **Latency** is the median round-trip time of several small requests; **jitter** is the average
   change between consecutive latency samples; **packet loss** is the share of failed requests.
-- **Bandwidth** ramps through progressively larger transfers and stops once a request runs long
-  enough to be representative, then takes the 90th percentile of the measured throughputs.
+- **Bandwidth** runs four parallel download streams (three for upload) for a fixed window,
+  discards the first ~0.7 s of TCP ramp-up, and reports the 90th percentile of the steady-state
+  throughput samples. Parallel streams matter: a single stream cannot fill a fast link and would
+  under-report, which is why the results would disagree with other speed tests.
 
-A full test typically transfers 30–90 MB and never more than about 200 MB.
+A full test usually transfers a few tens of MB and never more than about 170 MB.
 
 ## Privacy
 
