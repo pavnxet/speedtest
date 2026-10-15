@@ -136,7 +136,6 @@ body {
   text-anchor: middle;
   dominant-baseline: middle;
 }
-.gauge .needle { transform-box: view-box; transform-origin: 150px 150px; }
 .gauge .needle polygon { fill: var(--red); }
 .gauge .hub { fill: #fff; }
 .gauge .hub-ring { fill: none; stroke: var(--red); stroke-width: 3; }

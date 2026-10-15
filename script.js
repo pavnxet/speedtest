@@ -162,7 +162,7 @@ class Gauge {
         <path class="track" d="${track}" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="13" stroke-linecap="round"/>
         <path class="progress" d="" fill="none" stroke="url(#gaugeGrad)" stroke-width="13" stroke-linecap="round"/>
         <g class="ticks">${this._ticksMarkup()}</g>
-        <g class="needle"><polygon points="150,58 145.4,150 154.6,150" fill="#ff3b3b"/></g>
+        <g class="needle"><polygon points="" fill="#ff3b3b"/></g>
         <circle class="hub" cx="150" cy="150" r="6" fill="#ffffff"/>
         <circle class="hub-ring" cx="150" cy="150" r="11" fill="none" stroke="#ff3b3b" stroke-width="3"/>
         <text class="gauge-value" x="150" y="200">0</text>
@@ -171,7 +171,7 @@ class Gauge {
 
     this.ticksEl = this.el.querySelector('.ticks');
     this.progressEl = this.el.querySelector('.progress');
-    this.needleEl = this.el.querySelector('.needle');
+    this.needlePoly = this.el.querySelector('.needle polygon');
     this.valueEl = this.el.querySelector('.gauge-value');
     this.unitEl = this.el.querySelector('.gauge-unit');
     this.render();
@@ -220,10 +220,34 @@ class Gauge {
     });
   }
 
+  /* The needle polygon is recomputed from the angle every frame rather than
+     rotated with an SVG/CSS transform. Transforms on this element proved
+     fragile across browsers (a CSS transform-origin could double-apply the
+     rotation and swing the needle wildly), so we avoid them entirely. */
+  _drawNeedle(deg) {
+    if (!this.needlePoly) return;
+    const rad = (deg * Math.PI) / 180;
+    const dx = Math.sin(rad);
+    const dy = -Math.cos(rad);
+    const px = -dy;
+    const py = dx;
+    const len = 92;
+    const tail = 12;
+    const halfW = 4.8;
+    const tx = this.cx + dx * len;
+    const ty = this.cy + dy * len;
+    const bx = this.cx - dx * tail;
+    const by = this.cy - dy * tail;
+    const p1 = `${tx.toFixed(2)},${ty.toFixed(2)}`;
+    const p2 = `${(bx + px * halfW).toFixed(2)},${(by + py * halfW).toFixed(2)}`;
+    const p3 = `${(bx - px * halfW).toFixed(2)},${(by - py * halfW).toFixed(2)}`;
+    this.needlePoly.setAttribute('points', `${p1} ${p2} ${p3}`);
+  }
+
   render() {
     const f = clamp((this.shown - this.min) / (this.max - this.min), 0, 1);
     const deg = this.startDeg + this.sweepDeg * f;
-    if (this.needleEl) this.needleEl.setAttribute('transform', `rotate(${deg.toFixed(2)} ${this.cx} ${this.cy})`);
+    this._drawNeedle(deg);
     if (this.progressEl) this.progressEl.setAttribute('d', this._arcD(this.startDeg, deg, this.rTrack));
     if (this.valueEl) this.valueEl.textContent = this.shown >= 100 ? this.shown.toFixed(0) : this.shown.toFixed(1);
     if (this.unitEl) this.unitEl.textContent = this.unit;
@@ -501,6 +525,9 @@ function gradeColor(g) {
 
 function activityVerdicts(r) {
   const out = {};
+  // Only judge once both bandwidth directions have been measured, so the
+  // chips do not flash a verdict from partial data mid-test.
+  if (!isNum(r.down) || !isNum(r.up)) return out;
   if (isNum(r.down) && isNum(r.loss)) {
     out.streaming = r.down >= 25 && r.loss < 2 ? 'ok' : r.down >= 10 ? 'warn' : 'bad';
   }
